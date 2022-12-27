@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"path/filepath"
+	"sort"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,6 +31,126 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type WorkerInfo struct {
+	nReduce int
+	task Task
+	splitName string
+	id int
+}
+
+func (worker *WorkerInfo) init(nReduce int, task Task, splitName string) {
+	worker.nReduce = nReduce
+	worker.task = task
+	worker.splitName = splitName
+	worker.id = task.Id
+}
+
+func (worker *WorkerInfo) doMap(mapf func(string, string) []KeyValue) {
+	fileName := worker.splitName
+	fileContent, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		log.Fatal("read file error:", err)
+	}
+	interkv := mapf(fileName, string(fileContent))
+	worker.saveToIntermediateFiles(&interkv)
+
+}
+
+func (worker *WorkerInfo) saveToIntermediateFiles(kva *[]KeyValue) {
+	prefix := fmt.Sprintf("/tmp/mr-%v", worker.id)
+	files := make([]*os.File, worker.nReduce)
+	buffers := make([]*bufio.Writer, worker.nReduce)
+	encoders := make([]*json.Encoder, worker.nReduce)
+
+	for i := 0; i < worker.nReduce; i++ {
+		filePath := fmt.Sprintf("%v-%v-%v", prefix, i, os.Getpid())
+		file, err := os.Create(filePath)
+		if err != nil {
+			log.Fatalf("cannot create file %v: %v\n", filePath, err)
+		}
+		buf := bufio.NewWriter(file)
+		files = append(files, file)
+		buffers = append(buffers, buf)
+		encoders = append(encoders, json.NewEncoder(buf))
+	}
+	
+	for _, kv := range *kva {
+		idx := ihash(kv.Key) % worker.nReduce
+		err := encoders[idx].Encode(&kv)
+		if err != nil {
+			log.Fatalf("cannot encode %v to file\n", kv)
+		}
+	}
+
+	for i, buf := range buffers {
+		err := buf.Flush()
+		if err != nil {
+			log.Fatalf("cannot flush buffer for file: %v\n", files[i].Name())
+		}
+	}
+
+	// atomatically rename temp files 
+	for i, file := range files {
+		file.Close()
+		newPath := fmt.Sprintf("%v-%v", prefix, i)
+		err := os.Rename(file.Name(), newPath)
+		if err != nil {
+			log.Fatalf("cannot rename file %v\n", file.Name())
+		}
+	}
+}
+
+func (worker *WorkerInfo) doReduce(reducef func(string, []string) string) {
+	files, err := filepath.Glob(fmt.Sprintf("/tmp/mr-%v-%v", "*", worker.id))
+	if err != nil {
+		log.Fatal("cannot list intermediate files")
+	}
+	
+	kToVArr := make(map[string][]string)
+	
+	for _, filePath := range files {
+		file, err := os.Open(filePath)
+		if err != nil {
+			log.Fatalf("cannot open file %v\n", filePath)
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				log.Fatalf("cannot decode from file %v\n", filePath)
+				kToVArr[kv.Key] = append(kToVArr[kv.Key], kv.Value)
+			}
+		}
+	}
+
+	keys := make([]string, len(kToVArr))
+	for k := range kToVArr {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	
+	filePath := fmt.Sprintf("/tmp/mr-out-%v-%v", worker.id, os.Getpid())
+	file, err := os.Create(filePath)
+	if err != nil {
+		log.Fatalf("cannot create file %v\n", filePath)
+	}
+
+	for _, k := range keys {
+		res := reducef(k, kToVArr[k])
+		fmt.Fprintf(file, "%v %v\n", k, res)
+		if err != nil {
+			log.Fatalf("cannot write mr output (%v, %v) to file", k, res)
+		}
+	}
+
+	file.Close()
+	newPath := fmt.Sprintf("mr-out-%v", worker.id)
+	err = os.Rename(filePath, newPath)
+	if err != nil {
+		log.Fatalf("cannot rename file %v\n", filePath)
+	}
+}
 
 //
 // main/mrworker.go calls this function.
@@ -32,6 +159,22 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	worker := new(WorkerInfo)
+
+	getTaskReply := new(GetTaskReply)
+	call("Master.GetTask", &GetTaskArgs{}, &getTaskReply)
+	worker.init(getTaskReply.NReduce, getTaskReply.AssignedTask, getTaskReply.SplitName)
+
+	switch worker.task.Type {
+	case Map:
+		worker.doMap(mapf)
+	case Reduce:
+		worker.doReduce(reducef)
+	default:
+		// TODO: 
+		
+	}
+
 
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
