@@ -1,11 +1,14 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
+	"time"
 )
 
 type TaskType int
@@ -13,6 +16,8 @@ const (
 	_ TaskType = iota
 	Map 
 	Reduce
+	NoTask
+	Exit
 	MAX_N_MAP = 100
 )
 
@@ -24,24 +29,80 @@ type Task struct {
 type Master struct {
 	// Your definitions here.
 	nReduceTasks int
-	// workersAddr []net.IP
 	splits []string
-	tasksCh chan Task // buffered task channel for both Map and Reduce tasks
-
-
+	mapTasksCh chan Task
+	reduceTasksCh chan Task
+	mapTasksDone map[int]bool
+	reduceTasksDone map[int]bool
+	mu sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
 func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 
-	reply.NReduce = m.nReduceTasks
-	reply.AssignedTask = <- m.tasksCh
-	reply.SplitName = m.splits[reply.AssignedTask.Id]
+	switch {
+	case m.Done():
+		reply.AssignedTask = Task{-1, Exit}
+	case m.isAllMapTasksDone():
+		reply.NReduce = m.nReduceTasks
+		reply.SplitName = ""
 
-	// TODO:
-	// - assign no work reply back when task channel is empty
+		select {
+		case reply.AssignedTask = <- m.reduceTasksCh: // there are available tasks to assign
+			go m.waitForWorker(reply.AssignedTask)
+		default:
+			reply.AssignedTask = Task{-1, NoTask}
+		}
+	default:
+		reply.NReduce = m.nReduceTasks
+		
+		select {
+		case reply.AssignedTask = <- m.mapTasksCh:
+			reply.SplitName = m.splits[reply.AssignedTask.Id]
+
+			go m.waitForWorker(reply.AssignedTask)
+		default:
+			reply.AssignedTask = Task{-1, NoTask}
+		}
+	}
 	
 	return nil
+}
+
+func (m *Master) waitForWorker(task Task) {
+	time.Sleep(10 * time.Second)
+
+	switch task.Type {
+	case Map:
+		if _, isDone := m.mapTasksDone[task.Id]; !isDone {
+			m.mapTasksCh <- task
+		}
+	case Reduce:
+		if _, isDone := m.reduceTasksDone[task.Id]; !isDone {
+			m.reduceTasksCh <- task
+		}
+	default:
+	}
+}
+
+func (m *Master) CommitTask(args *CommitTaskArgs, reply *CommitTaskReply) error {
+	taskToCommit := args.ToCommitTask
+	fmt.Printf("task %v is committed\n", taskToCommit)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if taskToCommit.Type == Map {
+		m.mapTasksDone[taskToCommit.Id] = true
+	} else {
+		m.reduceTasksDone[taskToCommit.Id] = true
+	}
+
+	return nil
+}
+
+
+func (m *Master) isAllMapTasksDone() bool {
+	return len(m.mapTasksDone) >= len(m.splits)
 }
 
 //
@@ -79,7 +140,7 @@ func (m *Master) Done() bool {
 	ret := false
 
 	// Your code here.
-
+	ret = len(m.reduceTasksDone) >= m.nReduceTasks
 
 	return ret
 }
@@ -95,14 +156,17 @@ func MakeMaster(files []string, nReduce int) *Master {
 	// Your code here.
 	m.nReduceTasks = nReduce
 	m.splits = files
-	m.tasksCh = make(chan Task, MAX_N_MAP + m.nReduceTasks)
+	m.mapTasksCh = make(chan Task, MAX_N_MAP)
+	m.reduceTasksCh = make(chan Task, m.nReduceTasks)
+	m.mapTasksDone = make(map[int]bool)
+	m.reduceTasksDone = make(map[int]bool)
 
 	for i := range m.splits {
-		m.tasksCh <- Task{i, Map}
+		m.mapTasksCh <- Task{i, Map}
 	}
 
 	for i := 0; i < m.nReduceTasks; i++ {
-		m.tasksCh <- Task{i, Reduce}
+		m.reduceTasksCh <- Task{i, Reduce}
 	}
 
 	m.server()

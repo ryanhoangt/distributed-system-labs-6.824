@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 //
@@ -30,6 +31,10 @@ func ihash(key string) int {
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
+
+const (
+	TaskInterval time.Duration = 200
+)
 
 type WorkerInfo struct {
 	nReduce int
@@ -52,15 +57,15 @@ func (worker *WorkerInfo) doMap(mapf func(string, string) []KeyValue) {
 		log.Fatal("read file error:", err)
 	}
 	interkv := mapf(fileName, string(fileContent))
-	worker.saveToIntermediateFiles(&interkv)
 
+	worker.saveToIntermediateFiles(interkv)
 }
 
-func (worker *WorkerInfo) saveToIntermediateFiles(kva *[]KeyValue) {
+func (worker *WorkerInfo) saveToIntermediateFiles(kva []KeyValue) {
 	prefix := fmt.Sprintf("/tmp/mr-%v", worker.id)
-	files := make([]*os.File, worker.nReduce)
-	buffers := make([]*bufio.Writer, worker.nReduce)
-	encoders := make([]*json.Encoder, worker.nReduce)
+	files := make([]*os.File, 0, worker.nReduce)
+	buffers := make([]*bufio.Writer, 0, worker.nReduce)
+	encoders := make([]*json.Encoder, 0, worker.nReduce)
 
 	for i := 0; i < worker.nReduce; i++ {
 		filePath := fmt.Sprintf("%v-%v-%v", prefix, i, os.Getpid())
@@ -74,7 +79,10 @@ func (worker *WorkerInfo) saveToIntermediateFiles(kva *[]KeyValue) {
 		encoders = append(encoders, json.NewEncoder(buf))
 	}
 	
-	for _, kv := range *kva {
+	// fmt.Printf("kva: %v", kva)
+	// fmt.Printf("worker info: %v", *worker)
+
+	for _, kv := range kva {
 		idx := ihash(kv.Key) % worker.nReduce
 		err := encoders[idx].Encode(&kv)
 		if err != nil {
@@ -115,16 +123,17 @@ func (worker *WorkerInfo) doReduce(reducef func(string, []string) string) {
 		}
 
 		dec := json.NewDecoder(file)
-		for {
+		for dec.More() {
 			var kv KeyValue
-			if err := dec.Decode(&kv); err != nil {
+			err := dec.Decode(&kv)
+			if err != nil {
 				log.Fatalf("cannot decode from file %v\n", filePath)
-				kToVArr[kv.Key] = append(kToVArr[kv.Key], kv.Value)
 			}
+			kToVArr[kv.Key] = append(kToVArr[kv.Key], kv.Value)
 		}
 	}
 
-	keys := make([]string, len(kToVArr))
+	keys := make([]string, 0, len(kToVArr))
 	for k := range kToVArr {
 		keys = append(keys, k)
 	}
@@ -160,19 +169,44 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 	worker := new(WorkerInfo)
+	
+	for {
+		getTaskReply := new(GetTaskReply)
+		succ := call("Master.GetTask", &GetTaskArgs{}, &getTaskReply)
+		if !succ {
+			fmt.Println("Failed to contact master, worker exiting...")
+			return
+		}
 
-	getTaskReply := new(GetTaskReply)
-	call("Master.GetTask", &GetTaskArgs{}, &getTaskReply)
-	worker.init(getTaskReply.NReduce, getTaskReply.AssignedTask, getTaskReply.SplitName)
+		worker.init(getTaskReply.NReduce, getTaskReply.AssignedTask, getTaskReply.SplitName)
 
-	switch worker.task.Type {
-	case Map:
-		worker.doMap(mapf)
-	case Reduce:
-		worker.doReduce(reducef)
-	default:
-		// TODO: 
-		
+		commitReply := new(CommitTaskReply)
+		callSucc := true
+		switch worker.task.Type {
+		case Exit:
+			fmt.Println("All jobs are done, worker exiting...")
+			return
+		case Map:
+			worker.doMap(mapf)
+			callSucc = call("Master.CommitTask", 
+			&CommitTaskArgs{
+				Task{worker.task.Id, worker.task.Type},
+				}, &commitReply)
+		case Reduce:
+			worker.doReduce(reducef)
+			callSucc = call("Master.CommitTask", 
+			&CommitTaskArgs{
+				Task{worker.task.Id, worker.task.Type},
+				}, &commitReply)
+		default: // NoTask
+		}
+
+		if !callSucc {
+			fmt.Println("Cannot commit task to master, worker exitting...")
+			return
+		}
+
+		time.Sleep(time.Millisecond * TaskInterval)
 	}
 
 
