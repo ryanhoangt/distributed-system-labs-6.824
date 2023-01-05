@@ -23,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"fmt"
+	// "fmt"
 
 	"../labrpc"
 )
@@ -96,9 +96,9 @@ type Raft struct {
 	winElecCh chan bool
 }
 
-func (rf *Raft) ToStr() string {
-	return fmt.Sprintf("[rf %d term%d state%d]", rf.me, rf.currentTerm, rf.curState)
-}
+// func (rf *Raft) ToStr() string {
+// 	return fmt.Sprintf("[rf %d term%d state%d]", rf.me, rf.currentTerm, rf.curState)
+// }
 
 type LogEntry struct {
 	Term int
@@ -190,7 +190,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Printf("[rf %d term%d state%d] receive RequestVote: %v\n", rf.me, rf.currentTerm, rf.curState, *args)
+	// fmt.Printf("[rf %d term%d state%d] receive RequestVote: %v\n", rf.me, rf.currentTerm, rf.curState, *args)
 
 	// check stale request
 	if args.Term < rf.currentTerm {
@@ -205,7 +205,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
 		} else {
-			fmt.Println("send step down signal inside RequestVote")
+			// fmt.Println("send step down signal inside RequestVote")
 			rf.stepDownToFollower(args.Term)
 		}
 	}
@@ -218,10 +218,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// && rf.isLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		rf.votedFor = args.Candidate
 		reply.VoteGranted = true
-		rf.grantVoteCh <- true
+		rf.asyncSendToCh(rf.grantVoteCh, true)
 	}
 	
-	fmt.Printf("[rf %d term%d state%d] reply to req %v: %v\n", rf.me, rf.currentTerm, rf.curState, *args, *reply)
+	// fmt.Printf("[rf %d term%d state%d] reply to req %v: %v\n", rf.me, rf.currentTerm, rf.curState, *args, *reply)
+}
+
+// send to a channel without waiting, synonymous to 
+// sending to a infinite buffer channel
+// this is required to avoid potential deadlock
+func (rf *Raft) asyncSendToCh(ch chan bool, signal bool) {
+	select {
+	case ch <- signal:
+	default:
+	}
 }
 
 func (rf *Raft) isLogUpToDate(lastLogIndex int, lastLogTerm int) bool {
@@ -283,7 +293,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Printf("[rf %d term%d state%d] receive heartbeat: %v\n", rf.me, rf.currentTerm, rf.curState, *args)
+	// fmt.Printf("[rf %d term%d state%d] receive heartbeat: %v\n", rf.me, rf.currentTerm, rf.curState, *args)
 
 	// check stale request
 	if args.Term < rf.currentTerm {
@@ -297,9 +307,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.curState == Follower {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
-			rf.heartbeatCh <- true
+			rf.asyncSendToCh(rf.heartbeatCh, true)
 		} else {
-			fmt.Println("send step down signal inside AppendEntries")
+			// fmt.Println("send step down signal inside AppendEntries")
 			rf.stepDownToFollower(args.Term)
 		}
 	}
@@ -403,7 +413,7 @@ func (rf *Raft) backgroundTask()  {
 			case <- rf.heartbeatCh:
 			case <- rf.grantVoteCh:
 			case <- time.After(time.Millisecond * getElectionTimeout()):
-				rf.convertToCandidate()
+				rf.convertToCandidate(Follower)
 			}
 		case Candidate:
 			select {
@@ -412,13 +422,13 @@ func (rf *Raft) backgroundTask()  {
 			case <- rf.winElecCh:
 				rf.convertToLeader()
 			case <- time.After(time.Millisecond * getElectionTimeout()):
-				fmt.Printf("[rf %d] cannot become leader for term %d, start new election\n", rf.me, rf.currentTerm)
-				rf.convertToCandidate()
+				// fmt.Printf("[rf %d] cannot become leader for term %d, start new election\n", rf.me, rf.currentTerm)
+				rf.convertToCandidate(Candidate)
 			}
 		case Leader:
 			select {
 			case <- rf.stepDownCh:
-				fmt.Printf("[rf %d term%d state%d] step down from leader to follower\n", rf.me, rf.currentTerm, rf.curState)
+				// fmt.Printf("[rf %d term%d state%d] step down from leader to follower\n", rf.me, rf.currentTerm, rf.curState)
 				// state should already be follower
 			case <- time.After(time.Millisecond * time.Duration(HEARTBEAT_INTERVAL)):
 				rf.mu.Lock()
@@ -435,7 +445,12 @@ func (rf* Raft) convertToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Printf("[rf %d] becoming leader for term %d\n", rf.me, rf.currentTerm)
+	// NOTE: guarding after reacquire the lock
+	if rf.curState != Candidate {
+		return
+	}
+
+	// fmt.Printf("[rf %d] becoming leader for term %d\n", rf.me, rf.currentTerm)
 	
 	// rf.resetAllChannels()
 	rf.curState = Leader
@@ -446,7 +461,7 @@ func (rf* Raft) convertToLeader() {
 
 // only call when lock is acquired
 func (rf *Raft) broadcastHeartbeat() {
-	fmt.Printf("[rf %d term%d state%d] broadcasting heartbeat\n", rf.me, rf.currentTerm, rf.curState)
+	// fmt.Printf("[rf %d term%d state%d] broadcasting heartbeat\n", rf.me, rf.currentTerm, rf.curState)
 
 	args := AppendEntriesArgs{
 		Term: rf.currentTerm,
@@ -476,9 +491,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) convertToCandidate() {
+func (rf *Raft) convertToCandidate(fromState State) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// NOTE: guarding after reacquire the lock
+	if rf.curState != fromState {
+		return
+	}
 
 	// rf.resetAllChannels()
 	rf.curState = Candidate
@@ -519,7 +539,7 @@ func (rf *Raft) broadcastRequestVote() {
 			}
 
 			if reply.Term > rf.currentTerm {
-				fmt.Println("send step down signal inside broadcastReqVote")
+				// fmt.Println("send step down signal inside broadcastReqVote")
 				rf.stepDownToFollower(reply.Term)
 				return
 			}
@@ -528,7 +548,7 @@ func (rf *Raft) broadcastRequestVote() {
 				rf.totalVotesReceived += 1
 
 				if rf.totalVotesReceived == len(rf.peers) / 2 + 1 {
-					rf.winElecCh <- true
+					rf.asyncSendToCh(rf.winElecCh, true)
 				}
 			}
 
@@ -544,7 +564,7 @@ func (rf *Raft) stepDownToFollower(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.curState = Follower
 	rf.votedFor = -1
-	rf.stepDownCh <- true
+	rf.asyncSendToCh(rf.stepDownCh, true)
 }
 
 func checkError(errMsg string, err error) {
